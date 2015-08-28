@@ -11,11 +11,25 @@ import time
 from qingcloud.iaas import connect_to_zone
 import config
 
-TRANSITION_STATE = [
+INSTANCE_TRANSITION_STATE = [
     "creating", "starting", "stopping", "restarting", "suspending", "resuming", "terminating", "recovering", "resetting"
+]
+IPS_TRANSITION_STATE = [
+    "associating", "dissociating", "suspending", "resuming", "releasing"
+]
+
+STAND_BY_STATE = [
+    "running",  # 主机准备好
+    "available",  # ip准备好
+]
+
+response_resources_name = [
+    "instance_set",  # 主机键值
+    "eip_set",  # ip键值
 ]
 
 CN_SERVER_NAME = 'server_cn'
+CN_IP_NAME = 'ip_cn'
 
 conn = connect_to_zone(
     'gd1',
@@ -44,29 +58,53 @@ def ensure_keypair():
                                public_key=config.MACHINE_PUB_KEY)['keypair_id']
 
 
+class TimeOutException(Exception):
+    pass
+
+
+def wait_call(callback, timeout=10, *args, **kwargs):
+    for _ in xrange(timeout):
+        print "等待中"
+        time.sleep(1)
+        pending_ins = callback(*args, **kwargs)['instance_set']
+        if pending_ins and pending_ins[0] and 'status' in pending_ins[0] and pending_ins[0]['status'] in STAND_BY_STATE:
+            return True
+    raise TimeOutException
+
+
+def wait_instance(instance_id, timeout=10):
+    return wait_call(conn.describe_instances, timeout=timeout, instances=[instance_id])
+
+
+def wait_eip(eip_id, timeout=10):
+    return wait_call(conn.describe_eips, timeout=timeout, instances=[eip_id])
+
+
 def ensure_server(server_name=CN_SERVER_NAME, timeout=10):
     """
     确保不会重复创建server
     :return: instance_id
     """
     all_instance_set = conn.describe_instances(
-        status=["pending", "running", "stopped", "suspended"]+TRANSITION_STATE)['instance_set']
+        search_word=server_name,
+        status=["pending", "running", "stopped", "suspended"] + INSTANCE_TRANSITION_STATE)['instance_set']
     for instance in all_instance_set:
-        if instance['instance_name'] == server_name:
-            if instance['status'] == 'pending' or instance['status'] in TRANSITION_STATE:
-                for _ in xrange(timeout):
-                    print "等待中"
-                    time.sleep(1)
-                    pending_ins = conn.describe_instances(instances=[instance['instance_id']])['instance_set']
-                    if pending_ins and pending_ins[0]['status'] != 'pending':
-                        return instance['instance_id']
-                raise Exception('创建instance_name: %s 超时' % server_name)
-            elif instance['status'] == 'running':
-                # 目标资源正在运行，直接返回
-                return instance['instance_id']
-            else:
-                # 资源需要删除
-                conn.terminate_instances(instances=[instance['instance_id']])
+        if instance['status'] in INSTANCE_TRANSITION_STATE + ['pending']:
+            try:
+                if wait_instance(instance['instance_id'], timeout=timeout):
+                    return instance['instance_id']
+            except TimeOutException:
+                Exception('创建instance_name: %s 超时' % server_name)
+        elif instance['status'] == 'running':
+            # 目标资源正在运行，直接返回
+            result_id = instance['instance_id']
+            # 资源需要删除
+            conn.terminate_instances(instances=list(set(
+                [tins['instance_id'] for tins in all_instance_set]) - {result_id}))
+            return result_id
+        else:
+            # 资源需要删除
+            conn.terminate_instances(instances=[instance['instance_id']])
     run_ins = conn.run_instances(instance_name="server_cn", image_id='trustysrvx64e', cpu=1, memory=1024,
                                  login_mode="keypair", login_keypair=ensure_keypair())
     if 'instances' not in run_ins or len(run_ins['instances']) == 0:
@@ -74,19 +112,55 @@ def ensure_server(server_name=CN_SERVER_NAME, timeout=10):
     return ensure_server(server_name)
 
 
-def delete_all_instance_by_server_name(server_name=CN_SERVER_NAME):
+def delete_instance_by_server_name(server_name=CN_SERVER_NAME):
     need_delete_list = [
         instance['instance_id'] for instance in conn.describe_instances(
-            status=["pending", "running", "stopped", "suspended"]+TRANSITION_STATE,
-            instance_name=server_name,
-    )['instance_set']]
+            status=["pending", "running", "stopped", "suspended"] + INSTANCE_TRANSITION_STATE,
+            search_word=server_name,
+        )['instance_set']]
     if not need_delete_list:
         return
     ret = conn.terminate_instances(instances=need_delete_list)
     if ret.get('ret_code') != 0:
         print 'api访问错误，等待5秒重试'
         time.sleep(5)
-        ret = delete_all_instance_by_server_name(server_name)
+        ret = delete_instance_by_server_name(server_name)
+    return ret
+
+
+def ensure_ip(ip_name=CN_IP_NAME, timeout=10):
+    eip_set = conn.describe_eips(
+        search_word=ip_name,
+        status=["pending", "available", "suspended"] + IPS_TRANSITION_STATE)['eip_set']
+    for eip in eip_set:
+        if eip['status'] in ["pending"] + IPS_TRANSITION_STATE:
+            if wait_eip(eip['eip_id'], timeout=timeout):
+                return eip['eip_id']
+        elif eip['status'] == "available":
+            # 目标资源正在运行，直接返回
+            result_id = eip['eip_id']
+            # 资源需要删除
+            conn.release_eips(eips=list(set(
+                [teip['eip_id'] for teip in eip_set]) - {result_id}))
+            return result_id
+        else:
+            conn.release_eips(eips=[eip['eip_id']])
+    run_ips = conn.allocate_eips(bandwidth=15, billing_mode='traffic', eip_name=ip_name)
+    if 'eips' not in run_ips or len(run_ips['eips']) == 0:
+        raise Exception('创建instance_name: %s 配额不足' % ip_name)
+    return ensure_ip(ip_name)
+
+
+def delete_ip_by_ip_name(ip_name=CN_IP_NAME):
+    eip_set = conn.describe_eips(
+        status=["pending", "available", "suspended"] + IPS_TRANSITION_STATE)['eip_set']
+    if not eip_set:
+        return
+    ret = conn.release_eips(eips=[eip['eip_id'] for eip in eip_set])
+    if ret.get('ret_code') != 0:
+        print 'api访问错误，等待5秒重试'
+        time.sleep(5)
+        ret = delete_ip_by_ip_name(ip_name)
     return ret
 
 
