@@ -106,7 +106,7 @@ def ensure_server(server_name=CN_SERVER_NAME, timeout=10):
             # 资源需要删除
             conn.terminate_instances(instances=[instance['instance_id']])
     run_ins = conn.run_instances(instance_name="server_cn", image_id='trustysrvx64e', cpu=1, memory=1024,
-                                 login_mode="keypair", login_keypair=ensure_keypair())
+                                 login_mode="keypair", login_keypair=ensure_keypair(), vxnets=['vxnet-0'])
     if 'instances' not in run_ins or len(run_ins['instances']) == 0:
         raise Exception('创建instance_name: %s 配额不足' % server_name)
     return ensure_server(server_name)
@@ -156,6 +156,10 @@ def delete_ip_by_ip_name(ip_name=CN_IP_NAME):
         status=["pending", "available", "suspended"] + IPS_TRANSITION_STATE)['eip_set']
     if not eip_set:
         return
+    for _ in xrange(3):
+        dis_connect_info = conn.dissociate_eips(eips=[eip['eip_id'] for eip in eip_set])
+        if dis_connect_info['ret_code'] == 0:
+            break
     ret = conn.release_eips(eips=[eip['eip_id'] for eip in eip_set])
     if ret.get('ret_code') != 0:
         print 'api访问错误，等待5秒重试'
@@ -164,5 +168,24 @@ def delete_ip_by_ip_name(ip_name=CN_IP_NAME):
     return ret
 
 
+def bind_ip_to_server(eip_id, instance_id):
+    return conn.associate_eip(eip_id, instance_id)
+
+
+def get_server():
+    instance_id = ensure_server()
+    ip_id = ensure_ip()
+    bind_info = bind_ip_to_server(ip_id, instance_id)
+    ip_info = conn.describe_eips(eips=[ip_id])
+    assert ip_info['eip_set']
+    return ip_info['eip_set'][0]['eip_addr']
+
+def stop_server():
+    delete_instance_by_server_name()
+    return delete_ip_by_ip_name()
+
+
 if __name__ == '__main__':
-    ensure_server(CN_SERVER_NAME)
+    # print get_server()
+    # time.sleep(10)
+    print stop_server()
